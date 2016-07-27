@@ -1,0 +1,177 @@
+#!/bin/bash
+LOCALDRIVE="/dev/sda"
+USBDRIVE="/dev/sdc"
+HOSTNAME = "xps13"
+
+#### enable WIFI
+wifi-manager
+
+### make the font larger ###
+setfont sun12x22
+
+### set the keyboard ###
+# localectl list-keymaps # this will list all keymaps
+#loadkeys $KEYMAP
+localectl set-keymap us
+
+
+### reference http://www.rodsbooks.com/gdisk/sgdisk-walkthrough.html
+### partition the USBDRIVE ###
+sgdisk -og $USBDRIVE
+sgdisk -n 1:2048:4095 -c 1:"BIOS Boot Partition" -t 1:ef02 $USBDRIVE
+sgdisk -n 2:4096:413695 -c 2:"EFI System Partition" -t 2:ef00 $USBDRIVE
+sgdisk -n 3:413696:823295 -c 3:"Linux /boot" -t 3:8300 $USBDRIVE
+ENDSECTOR=`sgdisk -E $USBDRIVE`
+sgdisk -n 4:823296:$ENDSECTOR -c 4:"Linux LVM" -t 4:8e00 $USBDRIVE
+sgdisk -p $USBDRIVE
+
+### partition the SSD ###
+sgdisk -og $LOCALDRIVE
+sgdisk -n 1:0:0 -c 1:"Linux LVM" -t 1:8e00 $LOCALDRIVE
+sgdisk -p $LOCALDRIVE
+
+### create headers ###
+truncate -s 2M bootheader.img
+
+### crypt SSD LVM ###
+cryptsetup -v --cipher aes-xts-plain64 --key-size 256 --hash sha256 --iter-time 3000 --use-random luksFormat "${LOCALDRIVE}1"
+cryptsetup luksOpen "${LOCALDRIVE}1" lvm
+
+### crypt USBDRIVE ###
+cryptsetup -v --cipher aes-xts-plain64 --key-size 256 --hash sha256 --iter-time 3000 --use-random luksFormat "${USBDRIVE}2"
+cryptsetup open --header bootheader.img --type luks "${USBDRIVE}2" cryptboot
+mkfs.ext2 /dev/mapper/cryptboot
+mkfs.fat -F32 "${USBDRIVE}1"
+
+### make LVM partitions on SSD ###
+pvcreate /dev/mapper/lvm
+vgcreate vg /dev/mapper/lvm
+lvcreate -L 8G vg -n swap
+lvcreate -L 50G vg -n root
+lvcreate -l +100%FREE vg -n home
+swapon /dev/mapper/vg-swap
+mkfs.ext4 /dev/mapper/vg-root
+mkfs.ext4 /dev/mapper/vg-home
+
+### mount all drives ###
+mount /dev/mapper/vg-root /mnt
+mkdir /mnt/home
+mount /dev/mapper/vg-home /mnt/home
+mkdir /mnt/boot
+mount /dev/mapper/cryptboot /mnt/boot
+mv bootheader.img /mnt/boot
+mkdir /mnt/boot/efi
+mount "${USBDRIVE}1" /mnt/boot/efi
+lsblk
+
+pacstrap /mnt base base-devel grub-efi-x86_64 zsh vim git efibootmgr dialog wpa_supplicant
+genfstab -pU /mnt >> /mnt/etc/fstab
+tmpfs	/tmp	tmpfs	defaults,noatime,mode=1777	0	0 >> /mnt/etc/fstab
+ 
+arch-chroot /mnt /bin/bash
+ln -s /usr/share/zoneinfo/America/Chicago /etc/localtime
+hwclock --systohc --utc
+echo $HOSTNAME > /etc/hostname
+
+echo LANG=en_US.UTF-8 >> /etc/locale.conf
+echo LANGUAGE=en_US >> /etc/locale.conf
+echo LC_ALL=C >> /etc/locale.conf
+ 
+### reference /etc/fstab to get naming convention for the following:
+cryptboot	"${USBDRIVE}2"	none	luks >> /etc/crypttab
+#cryptboot UUID=....	none	luks,timeout=30
+
+## use the systemd hook ##
+## add the following to /etc/crypttab.initramfs
+# cryptboot	PARTUUID=<uuid of /boot goes here> 	none	header=/boot/header.img
+
+
+
+
+##### this should be the lsblk output ####
+#lsblk
+#NAME              	  MAJ:MIN RM   SIZE RO TYPE  MOUNTPOINT
+#sda                       8:0      0   200G  0 disk  
+#├─sda1                    8:1      0   512M  0 part  /boot/efi
+#├─sda2                    8:2      0   200M  0 part  
+#│ └─boot		  254:0    0   198M  0 crypt /boot
+#└─sda3                    8:3      0   100G  0 part  
+#  └─lvm                   254:1    0   100G  0 crypt 
+#    ├─MyStorage-swapvol   254:2    0     8G  0 lvm   [SWAP]
+#    ├─MyStorage-rootvol   254:3    0    15G  0 lvm   /
+#    └─MyStorage-homevol   254:4    0    77G  0 lvm   /home
+
+### modify mkinitcpio.conf to have HOOKS = " systemd ... block sd-encrypt encrypt lvm2 ... filesystems ..."
+# FILES = "/boot/bootheader.img"
+
+### modify /etc/default/grub to have:
+# ls -l /dev/disk/by-uuid/
+### USE THIS ONE FIRST -> GRUB_CMDLINE_LINUX = cryptdevice=UUID=<device UUID of SSD>:lvm root=/dev/mapper/vg-root
+# cryptdevice=UUID=<device ID of boot partition>:cryptboot:header 
+
+#GRUB_CMDLINE_LINUX = cryptdevice=UUID=<device UUID of SSD>:lvm root=/dev/mapper/vg-root cryptdevice=UUID=<device ID of boot partition>:cryptboot:header
+
+
+
+### In /etc/default/grub edit the line GRUB_CMDLINE_LINUX to GRUB_CMDLINE_LINUX="cryptdevice=/dev/sdX3:luks:allow-discards" then run:
+### GRUB_ENABLE_CRYPTODISK=y
+
+## modify /etc/crypttab
+# cryptboot /dev/USBDRIVE2	none	luks
+
+### later, make things mountable automatically: https://wiki.archlinux.org/index.php/Dm-crypt/Encrypting_an_entire_system#Post-installation
+### crypttab https://bbs.archlinux.org/viewtopic.php?id=203076
+
+# grub-mkconfig -o /boot/grub/grub.cfg
+# grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=grub --recheck
+
+#exit
+#unmount -R /mnt
+#swapoff -a
+#reboot
+
+
+#### /etc/crypttab
+
+#swap	/dev/lvm/swap	/dev/urandom	swap,cipher=aes-xts-plain64,size=256
+#tmp		/dev/lvm/tmp	/dev/urandom	tmp,cipher=aes-xts-plain64,size=256
+#backup	/dev/sdb1	/home/alice/backup.key
+#home	/dev/lvm/home	(ask for password)
+#externalDrive UUID=......	none	luks,timeout=180
+# use name from crypttab in /etc/fstab
+# /dev/mapper/externalDrive 	/mnt/backup	ext4	defaults,errors=remount-ro 0 2
+
+
+You get the UUID (partition) by using the command lsblk -f and adding it to crypttab in the form
+
+
+#### arch links
+#### encrypted grub
+
+
+#### remote header
+the --header option should be used on the SSD
+so the SSD gets added to /etc/crypttab.initramfs
+cryptdevice gets added for SSD with cryptdevice=/dev/SSD1:lvm:header
+Tip: You will notice that since the system partition only has "random" data, it does not have a partition table and by that an UUID or a name. But you can still have a consistent mapping using the disk id under /dev/disk/by-id/
+
+
+/etc/fstab will have an entry for the /boot partition like /dev/sdYn /boot ext2 noauto,rw,noatime 0 2 
+
+### encrypted root
+/etc/default/grub has cryptdevice=SSD 
+
+BOOT must be added to /etc/crypttab
+
+crypttab format is:
+first = /dev/mapper/FIRST_FIELD
+second = underlying block device (UUID=...)
+third = encryption password (or none)
+fourth = comma delim set of options
+
+
+https://bbs.archlinux.org/viewtopic.php?id=128843
+
+
+
+

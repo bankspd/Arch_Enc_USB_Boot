@@ -2,6 +2,8 @@
 LOCALDRIVE="/dev/sda"
 USBDRIVE="/dev/sdc"
 HOSTNAME = "xps13"
+ROOTUUID = ""
+BOOTUUID = ""
 
 #### enable WIFI
 wifi-manager
@@ -27,15 +29,15 @@ sgdisk -n 1:0:0 -c 1:"Linux LVM" -t 1:8e00 $LOCALDRIVE
 sgdisk -p $LOCALDRIVE
 
 ### create headers ###
-truncate -s 2M rootheader.img
+truncate -s 2M bootheader.img
 
 ### crypt SSD LVM ###
-cryptsetup -v --cipher aes-xts-plain64 --key-size 256 --hash sha256 --iter-time 3000 --use-random luksFormat "${LOCALDRIVE}1" --header rootheader.img
-cryptsetup luksOpen --header rootheader.img "${LOCALDRIVE}1" lvm
+cryptsetup -v --cipher aes-xts-plain64 --key-size 256 --hash sha256 --iter-time 3000 --use-random luksFormat "${LOCALDRIVE}1"
+cryptsetup luksOpen "${LOCALDRIVE}1" lvm
 
 ### crypt USBDRIVE ###
 cryptsetup -v --cipher aes-xts-plain64 --key-size 256 --hash sha256 --iter-time 3000 --use-random luksFormat "${USBDRIVE}2"
-cryptsetup open --type luks "${USBDRIVE}2" cryptboot
+cryptsetup open --header bootheader.img --type luks "${USBDRIVE}2" cryptboot
 mkfs.ext2 /dev/mapper/cryptboot
 mkfs.fat -F32 "${USBDRIVE}1"
 
@@ -55,7 +57,7 @@ mkdir /mnt/home
 mount /dev/mapper/vg-home /mnt/home
 mkdir /mnt/boot
 mount /dev/mapper/cryptboot /mnt/boot
-mv rootheader.img /mnt/boot
+mv bootheader.img /mnt/boot
 mkdir /mnt/boot/efi
 mount "${USBDRIVE}1" /mnt/boot/efi
 lsblk
